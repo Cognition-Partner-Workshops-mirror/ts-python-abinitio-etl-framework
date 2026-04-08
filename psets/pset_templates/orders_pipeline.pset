@@ -1,0 +1,11 @@
+# Orders Pipeline PSET — default/dev values
+# Override per-environment with psets/dev/, psets/uat/, psets/prod/
+
+define SOURCE_PATH /data/dev/raw/orders
+define TARGET_TABLE DEV.STAGING.ORDERS
+define PARTITION_COUNT 4
+define BATCH_SIZE 50000
+define LOG_LEVEL DEBUG
+define RECORD_SOURCE ORDER_SYSTEM_DEV
+define MAX_ERRORS 100
+define CHECKPOINT_DIR /tmp/abinitio/checkpoints/orders
