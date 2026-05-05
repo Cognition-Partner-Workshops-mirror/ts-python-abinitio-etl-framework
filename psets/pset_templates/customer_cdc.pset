@@ -1,0 +1,15 @@
+# Customer CDC Pipeline PSET — default values
+# Overridden per environment in psets/{dev|uat|prod}/
+
+define SOURCE_PATH /data/raw/customer
+define TARGET_TABLE STAGING.CUSTOMER_MASTER
+define PREVIOUS_SNAPSHOT_PATH /data/snapshots/customer/previous
+define CURRENT_SNAPSHOT_PATH /data/snapshots/customer/current
+define CDC_OUTPUT_PATH /data/cdc/customer
+define PARTITION_COUNT 8
+define HASH_COLUMNS customer_id,name,address,phone,email,status
+define KEY_COLUMNS customer_id
+define BATCH_SIZE 100000
+define MAX_ERRORS 50
+define AUDIT_TABLE AUDIT.CUSTOMER_CHANGES
+define RETENTION_DAYS 90

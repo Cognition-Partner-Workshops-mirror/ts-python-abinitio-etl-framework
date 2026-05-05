@@ -1,0 +1,14 @@
+# Orders Staging Load PSET — default values
+
+define SOURCE_PATH /data/cdc/orders/delta
+define TARGET_TABLE STAGING.ORDERS
+define TARGET_SCHEMA STAGING
+define PARTITION_COUNT 4
+define LOAD_MODE MERGE
+define BATCH_SIZE 50000
+define MAX_ERRORS 100
+define REJECT_PATH /data/rejects/orders
+define CHECKPOINT_DIR /tmp/abinitio/checkpoints/orders_staging
+define DML_FILE /data/projects/enterprise_etl/dml/order_items.dml
+define RECORD_SOURCE ORDER_SYSTEM
+define SLA_MINUTES 30
