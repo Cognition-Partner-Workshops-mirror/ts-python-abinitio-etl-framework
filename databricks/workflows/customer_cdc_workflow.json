@@ -1,0 +1,130 @@
+{
+  "$schema": "https://docs.databricks.com/api/workspace/jobs/create",
+  "_migrated_from": "scripts/run_customer_cdc.ksh (AutoSys: JOB_CUSTOMER_CDC, every 4 hours)",
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC pipeline — snapshot, detect changes, apply, audit. Migrated from Ab Initio KornShell orchestration (run_customer_cdc.ksh). Runs every 4 hours.",
+  "tags": {
+    "team": "data-engineering",
+    "source": "abinitio-migration",
+    "pipeline": "customer-cdc",
+    "schedule": "every-4-hours"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 */4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 3600,
+  "email_notifications": {
+    "on_failure": ["data-engineering@company.com"],
+    "on_start": [],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack-data-alerts"
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "task_key": "snapshot_customer",
+      "description": "Step 1: Snapshot current state from source (replaces snapshot_customer.mp)",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/etl-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "lakehouse.staging.customer_snapshot",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "log_level": "INFO",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "checkpoint_path": "/mnt/checkpoints/customer/snapshot",
+          "batch_date": ""
+        }
+      },
+      "job_cluster_key": "cdc_cluster",
+      "timeout_seconds": 900,
+      "max_retries": 2,
+      "min_retry_interval_millis": 30000
+    },
+    {
+      "task_key": "cdc_detect_and_apply",
+      "description": "Step 2+3: CDC detection and apply (replaces cdc_detect_customer.mp + apply_customer_changes.mp). Delta MERGE handles both in a single atomic operation.",
+      "depends_on": [
+        {
+          "task_key": "snapshot_customer"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/etl-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "/mnt/staging/customer_snapshot",
+          "target_table": "lakehouse.bronze.customer",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "hash_columns": "{{job.parameters.hash_columns}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "audit_table": "{{job.parameters.audit_table}}",
+          "run_timestamp": ""
+        }
+      },
+      "job_cluster_key": "cdc_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "cdc_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "200"
+        },
+        "custom_tags": {
+          "pipeline": "customer-cdc",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/customer"
+    },
+    {
+      "name": "partition_count",
+      "default": "8"
+    },
+    {
+      "name": "batch_size",
+      "default": "100000"
+    },
+    {
+      "name": "max_errors",
+      "default": "50"
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id"
+    },
+    {
+      "name": "hash_columns",
+      "default": "customer_id,name,address,phone,email,status"
+    },
+    {
+      "name": "audit_table",
+      "default": "lakehouse.audit.customer_changes"
+    }
+  ]
+}

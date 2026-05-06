@@ -1,0 +1,177 @@
+{
+  "$schema": "https://docs.databricks.com/api/workspace/jobs/create",
+  "_migrated_from": "scripts/run_daily_orders.ksh (AutoSys: JOB_DAILY_ORDERS_LOAD)",
+  "name": "daily_orders_pipeline",
+  "description": "Daily orders ETL pipeline — extract, CDC, staging, production. Migrated from Ab Initio KornShell orchestration (run_daily_orders.ksh).",
+  "tags": {
+    "team": "data-engineering",
+    "source": "abinitio-migration",
+    "pipeline": "orders",
+    "schedule": "daily"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 7200,
+  "email_notifications": {
+    "on_failure": ["data-engineering@company.com"],
+    "on_start": [],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack-data-alerts"
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "task_key": "extract_orders",
+      "description": "Phase 1: Extract from source systems (replaces extract_orders.mp graph)",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/etl-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "lakehouse.staging.orders_raw",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "log_level": "{{job.parameters.log_level}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "checkpoint_path": "/mnt/checkpoints/orders/extract",
+          "batch_date": "{{job.parameters.batch_date}}"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 1800,
+      "retry_on_timeout": true,
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "cdc_orders",
+      "description": "Phase 2: CDC detection (replaces cdc_orders.mp with 4 partitions)",
+      "depends_on": [
+        {
+          "task_key": "extract_orders"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/etl-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "/mnt/staging/orders_raw",
+          "target_table": "lakehouse.bronze.orders",
+          "key_columns": "order_id",
+          "hash_columns": "order_id,item_count,order_status",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "audit_table": "lakehouse.audit.orders_cdc",
+          "run_timestamp": ""
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "load_staging",
+      "description": "Phase 3: Load to staging (replaces load_staging_orders.mp)",
+      "depends_on": [
+        {
+          "task_key": "cdc_orders"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/etl-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "/mnt/cdc/orders/delta",
+          "target_table": "lakehouse.silver.orders",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "log_level": "{{job.parameters.log_level}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "checkpoint_path": "/mnt/checkpoints/orders/staging",
+          "batch_date": "{{job.parameters.batch_date}}"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "production_rollover",
+      "description": "Phase 4: Production load (replaces prod_rollover_orders.mp)",
+      "depends_on": [
+        {
+          "task_key": "load_staging"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/etl-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "/mnt/silver/orders",
+          "target_table": "lakehouse.gold.orders",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "log_level": "{{job.parameters.log_level}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "checkpoint_path": "/mnt/checkpoints/orders/production",
+          "batch_date": "{{job.parameters.batch_date}}"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "etl_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "200"
+        },
+        "custom_tags": {
+          "pipeline": "orders",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/orders"
+    },
+    {
+      "name": "partition_count",
+      "default": "4"
+    },
+    {
+      "name": "batch_size",
+      "default": "50000"
+    },
+    {
+      "name": "log_level",
+      "default": "INFO"
+    },
+    {
+      "name": "max_errors",
+      "default": "100"
+    },
+    {
+      "name": "batch_date",
+      "default": ""
+    }
+  ]
+}
