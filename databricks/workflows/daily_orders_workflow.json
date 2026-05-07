@@ -1,0 +1,182 @@
+{
+  "_comment": [
+    "Databricks Workflow: Daily Orders Pipeline",
+    "Migrated from: scripts/run_daily_orders.ksh",
+    "Original trigger: AutoSys job JOB_DAILY_ORDERS_LOAD",
+    "",
+    "Mapping:",
+    "  Phase 1 (air sandbox run extract_orders.mp)    -> task: extract_orders",
+    "  Phase 2 (air sandbox run cdc_orders.mp)         -> task: cdc_orders",
+    "  Phase 3 (air sandbox run load_staging_orders.mp) -> task: load_staging",
+    "  Phase 4 (air sandbox run prod_rollover_orders.mp)-> task: load_production",
+    "",
+    "PSET parameters are mapped to job-level parameters with defaults from",
+    "psets/pset_templates/orders_pipeline.pset and orders_staging.pset."
+  ],
+  "name": "daily_orders_pipeline",
+  "description": "Daily orders batch pipeline: extract -> CDC -> staging -> production. Migrated from run_daily_orders.ksh (AutoSys JOB_DAILY_ORDERS_LOAD).",
+  "tags": {
+    "team": "data-engineering",
+    "source": "abinitio-migration",
+    "pipeline": "orders",
+    "criticality": "high"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 7200,
+  "email_notifications": {
+    "on_failure": ["data-engineering@company.com"],
+    "on_start": [],
+    "on_success": []
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack-data-alerts"
+      }
+    ]
+  },
+  "parameters": [
+    {
+      "name": "batch_date",
+      "default": "",
+      "description": "Override batch date (YYYY-MM-DD). Defaults to today. Mapped from KSH BATCH_DATE=$(date +%Y-%m-%d)."
+    },
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/orders",
+      "description": "Source data path. Mapped from PSET SOURCE_PATH."
+    },
+    {
+      "name": "partition_count",
+      "default": "4",
+      "description": "Number of Spark partitions. Mapped from PSET PARTITION_COUNT / setenv.ksh AI_DEFAULT_PARTITIONS."
+    },
+    {
+      "name": "batch_size",
+      "default": "50000",
+      "description": "Records per micro-batch. Mapped from PSET BATCH_SIZE."
+    },
+    {
+      "name": "max_errors",
+      "default": "100",
+      "description": "Error threshold before abort. Mapped from PSET MAX_ERRORS / setenv.ksh AI_MAX_ERRORS."
+    },
+    {
+      "name": "log_level",
+      "default": "INFO",
+      "description": "Logging verbosity. Mapped from PSET LOG_LEVEL."
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "etl_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "200"
+        },
+        "custom_tags": {
+          "pipeline": "daily_orders",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "extract_orders",
+      "description": "Phase 1: Extract from source systems. Replaces: air sandbox run extract_orders.mp",
+      "job_cluster_key": "etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "lakehouse.bronze.orders_raw",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "batch_date": "{{job.parameters.batch_date}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "log_level": "{{job.parameters.log_level}}"
+        }
+      },
+      "timeout_seconds": 1800,
+      "retry_on_timeout": false,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "cdc_orders",
+      "description": "Phase 2: CDC detection. Replaces: air sandbox run cdc_orders.mp -partition 4",
+      "depends_on": [
+        { "task_key": "extract_orders" }
+      ],
+      "job_cluster_key": "etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "lakehouse.silver.orders",
+          "key_columns": "order_id",
+          "hash_columns": "order_id,item_count,order_status",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "audit_table": "lakehouse.ops.orders_change_audit",
+          "retention_days": "90",
+          "run_timestamp": ""
+        }
+      },
+      "timeout_seconds": 1800,
+      "retry_on_timeout": false,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "load_staging",
+      "description": "Phase 3: Load to staging. Replaces: air sandbox run load_staging_orders.mp. In Delta Lake, staging is a view/checkpoint — MERGE handles atomicity.",
+      "depends_on": [
+        { "task_key": "cdc_orders" }
+      ],
+      "job_cluster_key": "etl_cluster",
+      "sql_task": {
+        "query": {
+          "query_id": ""
+        },
+        "warehouse_id": "",
+        "parameters": {
+          "batch_date": "{{job.parameters.batch_date}}"
+        }
+      },
+      "timeout_seconds": 900
+    },
+    {
+      "task_key": "load_production",
+      "description": "Phase 4: Production rollover. Replaces: air sandbox run prod_rollover_orders.mp. With Delta Lake, this promotes silver -> gold via CREATE OR REPLACE TABLE AS SELECT.",
+      "depends_on": [
+        { "task_key": "load_staging" }
+      ],
+      "job_cluster_key": "etl_cluster",
+      "sql_task": {
+        "query": {
+          "query_id": ""
+        },
+        "warehouse_id": "",
+        "parameters": {
+          "batch_date": "{{job.parameters.batch_date}}"
+        }
+      },
+      "timeout_seconds": 900
+    }
+  ],
+  "run_as": {
+    "service_principal_name": "data-engineering-sp"
+  }
+}

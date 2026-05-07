@@ -1,0 +1,142 @@
+{
+  "_comment": [
+    "Databricks Workflow: Customer CDC Pipeline",
+    "Migrated from: scripts/run_customer_cdc.ksh",
+    "Original trigger: AutoSys job JOB_CUSTOMER_CDC (every 4 hours)",
+    "",
+    "Mapping:",
+    "  Step 1 (snapshot_customer.mp)       -> embedded in cdc_processor notebook (read_source_snapshot)",
+    "  Step 2 (cdc_detect_customer.mp)      -> embedded in cdc_processor notebook (run_cdc_merge)",
+    "  Step 3 (apply_customer_changes.mp)   -> embedded in cdc_processor notebook (MERGE INTO)",
+    "  Step 4 (audit_customer_changes.mp)   -> embedded in cdc_processor notebook (write_audit_trail)",
+    "",
+    "The four-step KSH pipeline collapses to a single notebook because Delta Lake",
+    "MERGE handles snapshot-compare-apply atomically. The audit step is a separate",
+    "task for isolation and retry independence.",
+    "",
+    "PSET parameters from psets/pset_templates/customer_cdc.pset are mapped",
+    "to job-level parameters."
+  ],
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC pipeline running every 4 hours: snapshot -> detect changes -> apply -> audit. Migrated from run_customer_cdc.ksh (AutoSys JOB_CUSTOMER_CDC).",
+  "tags": {
+    "team": "data-engineering",
+    "source": "abinitio-migration",
+    "pipeline": "customer-cdc",
+    "criticality": "high"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 0/4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 3600,
+  "email_notifications": {
+    "on_failure": ["data-engineering@company.com"],
+    "on_start": [],
+    "on_success": []
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack-data-alerts"
+      }
+    ]
+  },
+  "parameters": [
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/customer",
+      "description": "Source data path. Mapped from PSET SOURCE_PATH."
+    },
+    {
+      "name": "target_table",
+      "default": "lakehouse.silver.customer_master",
+      "description": "Target Delta table. Mapped from PSET TARGET_TABLE (STAGING.CUSTOMER_MASTER)."
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id",
+      "description": "Primary key columns. Mapped from PSET KEY_COLUMNS."
+    },
+    {
+      "name": "hash_columns",
+      "default": "customer_id,name,address,phone,email,status",
+      "description": "Columns for change detection hash. Mapped from PSET HASH_COLUMNS."
+    },
+    {
+      "name": "partition_count",
+      "default": "8",
+      "description": "Number of Spark partitions. Mapped from PSET PARTITION_COUNT."
+    },
+    {
+      "name": "batch_size",
+      "default": "100000",
+      "description": "Records per micro-batch. Mapped from PSET BATCH_SIZE."
+    },
+    {
+      "name": "max_errors",
+      "default": "50",
+      "description": "Error threshold before abort. Mapped from PSET MAX_ERRORS."
+    },
+    {
+      "name": "audit_table",
+      "default": "lakehouse.ops.customer_change_audit",
+      "description": "Audit log table. Mapped from PSET AUDIT_TABLE."
+    },
+    {
+      "name": "retention_days",
+      "default": "90",
+      "description": "Delta Lake retention period in days. Mapped from PSET RETENTION_DAYS."
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "cdc_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "200"
+        },
+        "custom_tags": {
+          "pipeline": "customer_cdc",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "run_customer_cdc",
+      "description": "Execute CDC: snapshot source, MERGE into target, generate audit trail. Replaces all 4 KSH steps (snapshot, detect, apply, audit).",
+      "job_cluster_key": "cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "{{job.parameters.target_table}}",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "hash_columns": "{{job.parameters.hash_columns}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "audit_table": "{{job.parameters.audit_table}}",
+          "retention_days": "{{job.parameters.retention_days}}",
+          "run_timestamp": ""
+        }
+      },
+      "timeout_seconds": 2700,
+      "retry_on_timeout": false,
+      "max_retries": 2,
+      "min_retry_interval_millis": 120000
+    }
+  ],
+  "run_as": {
+    "service_principal_name": "data-engineering-sp"
+  }
+}
