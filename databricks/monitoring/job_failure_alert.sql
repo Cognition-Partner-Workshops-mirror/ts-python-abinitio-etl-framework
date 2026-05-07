@@ -17,13 +17,15 @@ SELECT
     r.start_time                                    AS started_at,
     r.end_time                                      AS ended_at,
     ROUND(
-        TIMESTAMPDIFF(MINUTE, r.start_time, r.end_time), 1
+        TIMESTAMPDIFF(SECOND, r.start_time, r.end_time) / 60.0, 1
     )                                               AS duration_minutes,
     r.state_message                                 AS error_message,
     CONCAT(
-        'https://', current_catalog(), '.cloud.databricks.com/#job/',
+        'https://<WORKSPACE_HOST>/#job/',
         j.job_id, '/run/', r.run_id
     )                                               AS run_url
+    -- NOTE: Replace <WORKSPACE_HOST> with your Databricks workspace hostname
+    -- e.g., 'mycompany.cloud.databricks.com'
 FROM
     system.workflow.job_run_timeline r
     JOIN system.workflow.jobs j ON r.job_id = j.job_id

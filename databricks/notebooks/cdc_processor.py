@@ -26,7 +26,7 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("source_path", "", "Source Data Path")
+dbutils.widgets.text("source_path", "", "Source Data Path or Table Name")
 dbutils.widgets.text("target_table", "", "Target Delta Table")
 dbutils.widgets.text("key_columns", "customer_id", "Key Columns (comma-separated)")
 dbutils.widgets.text("hash_columns", "", "Hash Columns for Change Detection (comma-separated, empty=all)")
@@ -35,6 +35,7 @@ dbutils.widgets.text("batch_size", "100000", "Batch Size")
 dbutils.widgets.text("max_errors", "50", "Max Allowed Errors")
 dbutils.widgets.text("audit_table", "", "Audit Log Table")
 dbutils.widgets.text("run_timestamp", "", "Run Timestamp")
+dbutils.widgets.dropdown("source_format", "auto", ["auto", "csv", "delta", "table"], "Source Format")
 
 source_path = dbutils.widgets.get("source_path")
 target_table = dbutils.widgets.get("target_table")
@@ -46,6 +47,7 @@ batch_size = int(dbutils.widgets.get("batch_size"))
 max_errors = int(dbutils.widgets.get("max_errors"))
 audit_table = dbutils.widgets.get("audit_table")
 run_timestamp = dbutils.widgets.get("run_timestamp")
+source_format = dbutils.widgets.get("source_format")
 
 # COMMAND ----------
 
@@ -56,7 +58,6 @@ run_timestamp = dbutils.widgets.get("run_timestamp")
 
 import logging
 from datetime import datetime
-from functools import reduce
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
@@ -80,15 +81,35 @@ logger.info(f"CDC run: {run_id} | target={target_table} | keys={key_columns}")
 
 # COMMAND ----------
 
+def _resolve_source_format(path: str, fmt: str) -> str:
+    """Detect whether source_path is a Unity Catalog table or a file path."""
+    if fmt != "auto":
+        return fmt
+    if "." in path and "/" not in path:
+        try:
+            if spark.catalog.tableExists(path):
+                return "table"
+        except Exception:
+            pass
+    return "csv"
+
+resolved_format = _resolve_source_format(source_path, source_format)
+logger.info(f"Resolved source format: {resolved_format} for path: {source_path}")
+
 try:
-    source_df = (
-        spark.read
-        .format("csv")
-        .option("header", "true")
-        .option("inferSchema", "true")
-        .load(source_path)
-        .repartition(partition_count)
-    )
+    if resolved_format == "table":
+        source_df = spark.table(source_path).repartition(partition_count)
+    elif resolved_format == "delta":
+        source_df = spark.read.format("delta").load(source_path).repartition(partition_count)
+    else:
+        source_df = (
+            spark.read
+            .format("csv")
+            .option("header", "true")
+            .option("inferSchema", "true")
+            .load(source_path)
+            .repartition(partition_count)
+        )
     source_count = source_df.count()
     logger.info(f"Source snapshot: {source_count} records from {source_path}")
 

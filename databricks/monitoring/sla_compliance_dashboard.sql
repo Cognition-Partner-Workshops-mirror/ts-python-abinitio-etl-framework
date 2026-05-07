@@ -33,7 +33,7 @@ job_runs AS (
         r.start_time,
         r.end_time,
         ROUND(
-            TIMESTAMPDIFF(MINUTE, r.start_time, r.end_time), 1
+            TIMESTAMPDIFF(SECOND, r.start_time, r.end_time) / 60.0, 1
         )                                            AS duration_minutes,
         DATE(r.end_time)                             AS run_date,
         TIME(r.end_time)                             AS completion_time

@@ -26,12 +26,13 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("source_path", "", "Source Data Path")
+dbutils.widgets.text("source_path", "", "Source Data Path or Table Name")
 dbutils.widgets.text("target_table", "", "Target Delta Table")
 dbutils.widgets.text("partition_count", "4", "Number of Partitions")
 dbutils.widgets.text("batch_date", "", "Batch Date (YYYY-MM-DD)")
 dbutils.widgets.text("max_errors", "100", "Max Allowed Errors")
 dbutils.widgets.text("checkpoint_dir", "", "Checkpoint Directory")
+dbutils.widgets.dropdown("source_format", "auto", ["auto", "csv", "delta", "table"], "Source Format")
 dbutils.widgets.dropdown("log_level", "INFO", ["DEBUG", "INFO", "WARN", "ERROR"], "Log Level")
 
 source_path = dbutils.widgets.get("source_path")
@@ -40,6 +41,7 @@ partition_count = int(dbutils.widgets.get("partition_count"))
 batch_date = dbutils.widgets.get("batch_date")
 max_errors = int(dbutils.widgets.get("max_errors"))
 checkpoint_dir = dbutils.widgets.get("checkpoint_dir")
+source_format = dbutils.widgets.get("source_format")
 log_level = dbutils.widgets.get("log_level")
 
 # COMMAND ----------
@@ -82,17 +84,38 @@ logger.info(
 error_count = spark.sparkContext.accumulator(0)
 records_loaded = spark.sparkContext.accumulator(0)
 
+def _resolve_source_format(path: str, fmt: str) -> str:
+    """Detect whether source_path is a Unity Catalog table or a file path."""
+    if fmt != "auto":
+        return fmt
+    # Heuristic: table names contain dots (catalog.schema.table) and no slashes
+    if "." in path and "/" not in path:
+        try:
+            if spark.catalog.tableExists(path):
+                return "table"
+        except Exception:
+            pass
+    return "csv"
+
+resolved_format = _resolve_source_format(source_path, source_format)
+logger.info(f"Resolved source format: {resolved_format} for path: {source_path}")
+
 try:
-    # Read source data — Spark auto-parallelizes across available cores
-    raw_df = (
-        spark.read
-        .format("csv")
-        .option("header", "true")
-        .option("inferSchema", "true")
-        .option("mode", "PERMISSIVE")
-        .option("columnNameOfCorruptRecord", "_corrupt_record")
-        .load(source_path)
-    )
+    # Read source data — auto-detect table vs file path
+    if resolved_format == "table":
+        raw_df = spark.table(source_path)
+    elif resolved_format == "delta":
+        raw_df = spark.read.format("delta").load(source_path)
+    else:
+        raw_df = (
+            spark.read
+            .format("csv")
+            .option("header", "true")
+            .option("inferSchema", "true")
+            .option("mode", "PERMISSIVE")
+            .option("columnNameOfCorruptRecord", "_corrupt_record")
+            .load(source_path)
+        )
 
     total_records = raw_df.count()
     logger.info(f"Source record count: {total_records}")
