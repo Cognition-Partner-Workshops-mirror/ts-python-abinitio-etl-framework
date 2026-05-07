@@ -1,0 +1,259 @@
+{
+  "repo_notes": [
+    {
+      "content": ""
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "High-level introduction to the Ab Initio ETL Framework: its purpose, architecture, key subsystems, and migration context. Links to all major child sections.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Tables USed",
+      "purpose": "show the list of tables used in the repository.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Getting Started",
+      "purpose": "How to set up the local development environment, install dependencies, configure environment variables, and run the framework for the first time. Covers requirements.txt, .gitignore conventions, and the Air Sandbox.",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "System Architecture Overview",
+      "purpose": "Describes the three-layer separation of schema (DML), logic (Graphs), and configuration (PSETs), the Oracle-to-Teradata data flow, and the planned migration path to Databricks Lakehouse.",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Data Schemas (DML)",
+      "purpose": "Overview of the Ab Initio DML schema layer — what DML files are, how they are used by the Co>Operating System, and links to child pages covering specific schema families and the parser utility.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "DML Schema Reference",
+      "purpose": "Detailed reference for every DML record definition in the dml/ directory: customer, customer_address, common_address, order_items, account_balance, account_status, transaction_detail, and packed_account. Covers field types, delimiters, and special formats like packed/zoned decimal.",
+      "parent": "Data Schemas (DML)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "DML Parser Utility",
+      "purpose": "Documents utils/dml_parser.py — the DMLParser class that converts DML schema files into SQL CREATE TABLE statements and Spark-compatible StructType definitions. Covers parse_file(), parse_content(), _parse_field_line(), to_create_table_sql(), and the TYPE_MAP.",
+      "parent": "Data Schemas (DML)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Graph Execution Engine",
+      "purpose": "Overview of the graphs/ module — how Ab Initio graph logic is implemented in Python, covering both parallel execution orchestration and CDC processing. Links to child pages for each component.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Parallel Loader",
+      "purpose": "Deep dive into graphs/parallel_loader.py — the ParallelLoader and PartitionManager classes. Covers partition range generation, ThreadPoolExecutor-based parallel air_run invocation, the air_run command structure, callback mechanism, simulated execution fallback for CI/CD, and result aggregation.",
+      "parent": "Graph Execution Engine",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "CDC Processor",
+      "purpose": "Deep dive into graphs/cdc_processor.py — the CDCProcessor class implementing hash-based Change Data Capture. Covers key/compare column configuration, MD5 row hashing via _row_hash(), INSERT/UPDATE/DELETE delta computation, and equivalence to Ab Initio's 'Compare Records by Key' component.",
+      "parent": "Graph Execution Engine",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pipeline Orchestration & Scripts",
+      "purpose": "Overview of how pipelines are triggered and orchestrated — covering KornShell scripts, AutoSys job scheduling, and the multi-phase execution model. Links to child pages for environment setup and individual pipeline scripts.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Environment Initialization (setenv.ksh)",
+      "purpose": "Documents scripts/setenv.ksh — the mandatory environment setup script sourced by all pipeline scripts. Covers AI_HOME, AI_PROJECT_DIR, AB_HOME, database connection exports (ORACLE_PROD, TERADATA_DW), partitioning defaults, error handling modes (ABORT/CONTINUE/SKIP), and checkpoint configuration.",
+      "parent": "Pipeline Orchestration & Scripts",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pipeline Scripts",
+      "purpose": "Documents the two production pipeline entry-point scripts: run_daily_orders.ksh (4-phase batch: extract → CDC → staging → production rollover, triggered by AutoSys JOB_DAILY_ORDERS_LOAD) and run_customer_cdc.ksh (4-step CDC: snapshot → detect → apply → audit, runs every 4 hours via JOB_CUSTOMER_CDC).",
+      "parent": "Pipeline Orchestration & Scripts",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Parameter Sets (PSETs)",
+      "purpose": "Overview of the PSET configuration system — how runtime parameters decouple graph logic from environment-specific settings. Links to child pages for the manager API and the template files.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "PSETManager API",
+      "purpose": "Documents psets/pset_manager.py — the PSETManager class. Covers load_pset() with its environment-specific-to-base fallback resolution, _parse_pset() supporting both 'define KEY VALUE' and 'KEY=VALUE' syntax with os.path.expandvars expansion, render_pset(), write_pset(), and diff_psets() for configuration comparison.",
+      "parent": "Parameter Sets (PSETs)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "PSET Templates",
+      "purpose": "Documents the three PSET template files in psets/pset_templates/: orders_pipeline.pset (SOURCE_PATH, TARGET_TABLE, PARTITION_COUNT, BATCH_SIZE, MAX_ERRORS, CHECKPOINT_DIR), orders_staging.pset (LOAD_MODE MERGE, DML_FILE reference, SLA_MINUTES, REJECT_PATH), and customer_cdc.pset (HASH_COLUMNS, KEY_COLUMNS, snapshot paths, AUDIT_TABLE, RETENTION_DAYS).",
+      "parent": "Parameter Sets (PSETs)",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Deployment & Change Management",
+      "purpose": "Overview of the deployment automation subsystem — how code moves from development to production through ServiceNow CR gating, ChangeValidator static analysis, and UrbanCode Deploy integration. Links to child pages for each component.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "DeployManager",
+      "purpose": "Documents deployment/deploy_manager.py — the DeployManager class. Covers the deploy() workflow (CR status check → graph iteration → CR update), _get_cr_status() querying the ServiceNow Table API, _deploy_graph() wrapping the air_deploy CLI with -validate-after flag, _update_cr() posting work notes, environment variable configuration (UCD_URL, SNOW_URL, DEPLOY_API_TOKEN), and simulation fallback behavior.",
+      "parent": "Deployment & Change Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "ChangeValidator",
+      "purpose": "Documents deployment/change_validator.py — the ChangeValidator class used for pre-deployment static analysis. Covers the validate() method aggregating blocking vs. warning issues, _check_graph() checks (graph_file_exists, no_dev_paths_in_prod using dev_patterns list, naming_convention enforcing .mp/.mf extensions), and integration with PSETManager.",
+      "parent": "Deployment & Change Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Monitoring & SLA Tracking",
+      "purpose": "Overview of the monitoring subsystem — real-time job status polling, Slack alerting, and historical SLA compliance reporting. Links to child pages for JobMonitor and SLATracker.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "JobMonitor",
+      "purpose": "Documents monitoring/job_monitor.py — the JobMonitor class. Covers get_job_status() querying the AutoSys REST API, check_sla() for real-time deadline comparison, monitor_jobs() polling loop with terminal state detection (SUCCESS/COMPLETED/FAILURE), _send_alert() dispatching Slack webhook notifications distinguishing JOB_FAILURE (high severity) from SLA_BREACH (warning), and UNKNOWN status fallback on API errors.",
+      "parent": "Monitoring & SLA Tracking",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "SLATracker",
+      "purpose": "Documents monitoring/sla_tracker.py — the SLATracker class. Covers register_job() with sla_window_end and criticality metadata, record_completion() computing sla_met boolean, generate_report() producing sla_compliance_pct and avg_duration_min over a configurable lookback window, the JSON state file schema at /tmp/abinitio_sla_state.json, and the 90-day rolling history retention policy.",
+      "parent": "Monitoring & SLA Tracking",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Sample Data & Testing",
+      "purpose": "Overview of the test infrastructure and sample data files used for development and CI/CD validation. Links to child pages for sample data schemas and the test suite.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Sample Data Files",
+      "purpose": "Documents the three flat-file sample datasets in data/sample/: customers.dat (CSV, 9-column schema with CustomerID, contact info, Status enum ACTIVE/INACTIVE/PENDING), orders.dat (pipe-delimited, 7-column schema with OrderID, CustomerID, date, Status enum SHIPPED/DELIVERED/PROCESSING/CANCELLED, quantity, total, currency), and transactions.dat (pipe-delimited, 12-column schema with TXN ID, timestamp, merchant, SKU, channel WEB/STORE/APP).",
+      "parent": "Sample Data & Testing",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Test Suite",
+      "purpose": "Documents tests/test_pset_manager.py — the pytest-based test suite covering TestPSETManager (load, render, write, diff), TestDMLParser (field parsing, type mapping, CREATE TABLE generation), and TestCDCProcessor (insert/delete/no-change detection). Covers fixture patterns using tmp_path and pandas DataFrames.",
+      "parent": "Sample Data & Testing",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Glossary",
+      "purpose": "Definitions of all codebase-specific terms, Ab Initio jargon, abbreviations, and domain concepts that an onboarding engineer needs to know, with code pointers to relevant files and classes.",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    }
+  ]
+}
