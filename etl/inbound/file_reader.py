@@ -5,7 +5,7 @@ source files commonly used in Ab Initio ETL pipelines. It converts raw flat
 files into pandas DataFrames for downstream validation and transformation.
 """
 import logging
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 

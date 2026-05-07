@@ -8,9 +8,7 @@ pattern used in production graphs.
 """
 import logging
 import os
-from typing import Dict, List, Optional
-
-import pandas as pd
+from typing import Dict, List
 
 from etl.inbound.file_reader import PipeDelimitedReader
 from etl.inbound.validator import NullCheckValidator
