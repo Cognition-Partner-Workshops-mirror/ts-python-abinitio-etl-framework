@@ -1,0 +1,183 @@
+{
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC Pipeline — migrated from scripts/run_customer_cdc.ksh (AutoSys: JOB_CUSTOMER_CDC). Detects inserts/updates/deletes in customer master. Runs every 4 hours.",
+  "tags": {
+    "team": "data-engineering",
+    "source": "ab_initio_migration",
+    "original_script": "scripts/run_customer_cdc.ksh",
+    "autosys_job": "JOB_CUSTOMER_CDC"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 0/4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "job_clusters": [
+    {
+      "job_cluster_key": "cdc_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 8,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "8",
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true"
+        },
+        "custom_tags": {
+          "pipeline": "customer_cdc",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "run_timestamp",
+      "default": "{{job.start_time.iso_datetime}}"
+    },
+    {
+      "name": "source_path",
+      "default": "/data/raw/customer"
+    },
+    {
+      "name": "target_table",
+      "default": "catalog.silver.customer_master"
+    },
+    {
+      "name": "snapshot_path",
+      "default": "/data/snapshots/customer"
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id"
+    },
+    {
+      "name": "hash_columns",
+      "default": "customer_id,name,address,phone,email,status"
+    },
+    {
+      "name": "partition_count",
+      "default": "8"
+    },
+    {
+      "name": "batch_size",
+      "default": "100000"
+    },
+    {
+      "name": "max_errors",
+      "default": "50"
+    },
+    {
+      "name": "audit_table",
+      "default": "catalog.audit.customer_cdc_log"
+    },
+    {
+      "name": "retention_days",
+      "default": "90"
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "snapshot_customer",
+      "description": "Step 1: Snapshot current state from source (replaces snapshot_customer.mp)",
+      "job_cluster_key": "cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "catalog.bronze.customer_snapshot",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_date": "{{job.parameters.run_timestamp}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "cdc_detect",
+      "description": "Step 2: Compare with previous snapshot — hash-based CDC (replaces cdc_detect_customer.mp with -partition 8)",
+      "depends_on": [
+        {
+          "task_key": "snapshot_customer"
+        }
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "catalog.bronze.customer_snapshot",
+          "target_table": "{{job.parameters.target_table}}",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "hash_columns": "{{job.parameters.hash_columns}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "audit_table": "{{job.parameters.audit_table}}",
+          "run_timestamp": "{{job.parameters.run_timestamp}}"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "apply_changes",
+      "description": "Step 3: Apply changes to target (replaces apply_customer_changes.mp). In Delta Lake the MERGE in cdc_detect already applies changes; this task runs post-merge validation and optimization.",
+      "depends_on": [
+        {
+          "task_key": "cdc_detect"
+        }
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "sql_task": {
+        "query": {
+          "query_string": "OPTIMIZE {{job.parameters.target_table}} ZORDER BY (customer_id); ANALYZE TABLE {{job.parameters.target_table}} COMPUTE STATISTICS FOR ALL COLUMNS;"
+        },
+        "warehouse_id": "{{warehouse_id}}"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0
+    },
+    {
+      "task_key": "generate_audit_trail",
+      "description": "Step 4: Generate audit trail (replaces audit_customer_changes.mp). Leverages Delta Change Data Feed for comprehensive audit.",
+      "depends_on": [
+        {
+          "task_key": "apply_changes"
+        }
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "sql_task": {
+        "query": {
+          "query_string": "INSERT INTO {{job.parameters.audit_table}} SELECT *, '{{job.parameters.run_timestamp}}' AS run_timestamp FROM table_changes('{{job.parameters.target_table}}', (SELECT MAX(version) - 1 FROM (DESCRIBE HISTORY {{job.parameters.target_table}} LIMIT 2)), (SELECT MAX(version) FROM (DESCRIBE HISTORY {{job.parameters.target_table}} LIMIT 1)));"
+        },
+        "warehouse_id": "{{warehouse_id}}"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0
+    }
+  ],
+  "email_notifications": {
+    "on_failure": ["data-engineering-alerts@company.com"],
+    "on_start": [],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack_data_engineering_alerts"
+      }
+    ]
+  },
+  "format": "MULTI_TASK"
+}
