@@ -1,0 +1,190 @@
+{
+  "_comment": [
+    "Databricks Workflow — Customer CDC Pipeline (runs every 4 hours)",
+    "Migrated from: scripts/run_customer_cdc.ksh",
+    "Original trigger: AutoSys job JOB_CUSTOMER_CDC (every 4 hours)",
+    "",
+    "Ab Initio pipeline steps mapped to Databricks tasks:",
+    "  Step 1: air sandbox run snapshot_customer.mp      → task: snapshot_customer",
+    "  Step 2: air sandbox run cdc_detect_customer.mp     → task: cdc_detect (Delta MERGE)",
+    "  Step 3: air sandbox run apply_customer_changes.mp  → (merged into cdc_detect — MERGE is atomic)",
+    "  Step 4: air sandbox run audit_customer_changes.mp  → task: audit_changes",
+    "",
+    "PSET parameters (from customer_cdc.pset) mapped to job parameters:",
+    "  SOURCE_PATH               → {{source_path}}",
+    "  TARGET_TABLE               → {{target_table}}",
+    "  KEY_COLUMNS                → {{key_columns}}",
+    "  HASH_COLUMNS               → {{compare_columns}}",
+    "  PARTITION_COUNT             → {{partition_count}}",
+    "  AUDIT_TABLE                 → {{audit_table}}",
+    "  RETENTION_DAYS              → {{retention_days}}"
+  ],
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC pipeline — snapshot, detect changes, apply, audit. Runs every 4 hours. Migrated from Ab Initio KornShell orchestration (run_customer_cdc.ksh).",
+  "tags": {
+    "team": "data-engineering",
+    "source_system": "abinitio",
+    "pipeline": "customer_cdc",
+    "migrated_from": "run_customer_cdc.ksh",
+    "frequency": "4h"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 0/4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED",
+    "_comment": "Every 4 hours — matches original AutoSys JOB_CUSTOMER_CDC schedule"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 3600,
+  "job_clusters": [
+    {
+      "job_cluster_key": "cdc_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "{{partition_count}}",
+          "spark.databricks.delta.properties.defaults.enableChangeDataFeed": "true"
+        },
+        "custom_tags": {
+          "pipeline": "customer_cdc",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/customer",
+      "_comment": "Maps to Ab Initio PSET: SOURCE_PATH=/data/raw/customer"
+    },
+    {
+      "name": "target_table",
+      "default": "catalog.gold.customer_master",
+      "_comment": "Maps to Ab Initio PSET: TARGET_TABLE=STAGING.CUSTOMER_MASTER"
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id",
+      "_comment": "Maps to Ab Initio PSET: KEY_COLUMNS=customer_id"
+    },
+    {
+      "name": "compare_columns",
+      "default": "customer_id,name,address,phone,email,status",
+      "_comment": "Maps to Ab Initio PSET: HASH_COLUMNS=customer_id,name,address,phone,email,status"
+    },
+    {
+      "name": "partition_count",
+      "default": "8",
+      "_comment": "Maps to Ab Initio PSET: PARTITION_COUNT=8 (matches -partition 8 flag)"
+    },
+    {
+      "name": "audit_table",
+      "default": "catalog.audit.customer_cdc_log",
+      "_comment": "Maps to Ab Initio PSET: AUDIT_TABLE=AUDIT.CUSTOMER_CHANGES"
+    },
+    {
+      "name": "max_errors",
+      "default": "50",
+      "_comment": "Maps to Ab Initio PSET: MAX_ERRORS=50"
+    },
+    {
+      "name": "retention_days",
+      "default": "90",
+      "_comment": "Maps to Ab Initio PSET: RETENTION_DAYS=90"
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "snapshot_customer",
+      "description": "Step 1: Snapshot current state from source. Replaces: air sandbox run snapshot_customer.mp",
+      "job_cluster_key": "cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "catalog.bronze.customer_snapshot",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "100000",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "batch_date": "",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 900,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "cdc_detect",
+      "description": "Steps 2+3: CDC detect AND apply via Delta MERGE (atomic). Replaces: cdc_detect_customer.mp + apply_customer_changes.mp",
+      "depends_on": [
+        {"task_key": "snapshot_customer"}
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "catalog.bronze.customer_snapshot",
+          "target_table": "{{job.parameters.target_table}}",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "compare_columns": "{{job.parameters.compare_columns}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "audit_table": "{{job.parameters.audit_table}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "audit_changes",
+      "description": "Step 4: Generate audit trail. Replaces: air sandbox run audit_customer_changes.mp",
+      "depends_on": [
+        {"task_key": "cdc_detect"}
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "sql_task": {
+        "query": {
+          "query_string": "INSERT INTO {{job.parameters.audit_table}}_summary SELECT '{{job.parameters.target_table}}' AS target_table, current_timestamp() AS audit_timestamp, (SELECT COUNT(*) FROM table_changes('{{job.parameters.target_table}}', (SELECT MAX(version) FROM (DESCRIBE HISTORY {{job.parameters.target_table}} LIMIT 2))) WHERE _change_type = 'insert') AS inserts, (SELECT COUNT(*) FROM table_changes('{{job.parameters.target_table}}', (SELECT MAX(version) FROM (DESCRIBE HISTORY {{job.parameters.target_table}} LIMIT 2))) WHERE _change_type = 'update_postimage') AS updates, (SELECT COUNT(*) FROM table_changes('{{job.parameters.target_table}}', (SELECT MAX(version) FROM (DESCRIBE HISTORY {{job.parameters.target_table}} LIMIT 2))) WHERE _change_type = 'delete') AS deletes"
+        },
+        "warehouse_id": "auto"
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "task_key": "cleanup_snapshots",
+      "description": "Housekeeping: Remove snapshots older than retention window. Replaces manual archive rotation.",
+      "depends_on": [
+        {"task_key": "audit_changes"}
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "sql_task": {
+        "query": {
+          "query_string": "VACUUM catalog.bronze.customer_snapshot RETAIN {{job.parameters.retention_days}} HOURS"
+        },
+        "warehouse_id": "auto"
+      },
+      "timeout_seconds": 300
+    }
+  ],
+  "email_notifications": {
+    "on_start": [],
+    "on_success": ["data-engineering@company.com"],
+    "on_failure": ["data-engineering@company.com", "oncall@company.com"],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack_data_alerts",
+        "_comment": "Replaces Ab Initio Slack webhook alerts from job_monitor.py"
+      }
+    ]
+  }
+}
