@@ -1,0 +1,203 @@
+{
+  "_comment": [
+    "Databricks Workflow definition for Customer CDC Pipeline.",
+    "Migrated from: scripts/run_customer_cdc.ksh",
+    "Original trigger: AutoSys job JOB_CUSTOMER_CDC (every 4 hours)",
+    "",
+    "Ab Initio -> Databricks Mapping:",
+    "  run_customer_cdc.ksh             -> This workflow JSON definition",
+    "  AutoSys JOB_CUSTOMER_CDC         -> Databricks cron schedule (every 4 hours)",
+    "  4 sequential air sandbox runs    -> 3 notebook tasks (audit absorbed by Delta CDF)",
+    "  customer_cdc.pset parameters     -> job_parameters with matching defaults",
+    "  -partition 8                     -> partition_count parameter (8)",
+    "  RUN_TS=$(date +%Y-%m-%d_%H:%M:%S) -> {{job.start_time}} dynamic reference"
+  ],
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC pipeline — snapshot, detect changes, apply to target. Runs every 4 hours. Migrated from Ab Initio KornShell orchestration (run_customer_cdc.ksh).",
+  "tags": {
+    "team": "data-engineering",
+    "source": "ab_initio_migration",
+    "pipeline": "customer_cdc",
+    "schedule": "every_4_hours",
+    "original_script": "scripts/run_customer_cdc.ksh",
+    "original_autosys_job": "JOB_CUSTOMER_CDC"
+  },
+
+  "schedule": {
+    "quartz_cron_expression": "0 0 0/4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED",
+    "_comment": "Every 4 hours starting at midnight UTC. PAUSED for initial deployment."
+  },
+
+  "job_parameters": [
+    {
+      "name": "source_path",
+      "default": "abfss://raw@datalake.dfs.core.windows.net/customer",
+      "_comment": "Equivalent to PSET SOURCE_PATH=/data/raw/customer in customer_cdc.pset"
+    },
+    {
+      "name": "target_table",
+      "default": "catalog.silver.customer_master",
+      "_comment": "Equivalent to PSET TARGET_TABLE=STAGING.CUSTOMER_MASTER"
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id",
+      "_comment": "Equivalent to PSET KEY_COLUMNS=customer_id"
+    },
+    {
+      "name": "hash_columns",
+      "default": "first_name,last_name,email",
+      "_comment": "Equivalent to PSET HASH_COLUMNS=customer_id,name,address,phone,email,status (adjusted for customer.dml schema)"
+    },
+    {
+      "name": "partition_count",
+      "default": "8",
+      "_comment": "Equivalent to PSET PARTITION_COUNT=8 / -partition 8 in run_customer_cdc.ksh"
+    },
+    {
+      "name": "batch_size",
+      "default": "100000",
+      "_comment": "Equivalent to PSET BATCH_SIZE=100000"
+    },
+    {
+      "name": "max_errors",
+      "default": "50",
+      "_comment": "Equivalent to PSET MAX_ERRORS=50"
+    },
+    {
+      "name": "enable_deletes",
+      "default": "true",
+      "_comment": "Enable soft-delete for customers removed from source"
+    }
+  ],
+
+  "tasks": [
+    {
+      "task_key": "snapshot_customer",
+      "_comment": [
+        "Step 1: Snapshot current state from source.",
+        "Ab Initio equivalent: air sandbox run ${GRAPH_DIR}/snapshot_customer.mp",
+        "Reads source customer data into bronze layer."
+      ],
+      "description": "Step 1: Snapshot current customer state from source systems",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "catalog.bronze.customer_snapshot",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "file_format": "csv",
+          "load_mode": "overwrite"
+        }
+      },
+      "job_cluster_key": "cdc_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "retry_on_timeout": true
+    },
+    {
+      "task_key": "cdc_detect_and_apply",
+      "_comment": [
+        "Steps 2+3: Compare with previous snapshot and apply changes.",
+        "Ab Initio equivalent: cdc_detect_customer.mp + apply_customer_changes.mp",
+        "Merged into a single Delta Lake MERGE operation.",
+        "In Ab Initio these were two separate graph executions;",
+        "Delta MERGE handles detection and application atomically."
+      ],
+      "description": "Steps 2+3: Detect CDC changes and apply via Delta Lake MERGE",
+      "depends_on": [
+        {"task_key": "snapshot_customer"}
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "catalog.bronze.customer_snapshot",
+          "target_table": "{{job.parameters.target_table}}",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "hash_columns": "{{job.parameters.hash_columns}}",
+          "enable_deletes": "{{job.parameters.enable_deletes}}",
+          "file_format": "delta"
+        }
+      },
+      "job_cluster_key": "cdc_cluster",
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "audit_trail_validation",
+      "_comment": [
+        "Step 4: Generate audit trail.",
+        "Ab Initio equivalent: air sandbox run ${GRAPH_DIR}/audit_customer_changes.mp",
+        "In Databricks, Delta Change Data Feed (CDF) provides the audit trail",
+        "automatically. This task validates the CDF output and logs statistics."
+      ],
+      "description": "Step 4: Validate audit trail via Delta Change Data Feed",
+      "depends_on": [
+        {"task_key": "cdc_detect_and_apply"}
+      ],
+      "sql_task": {
+        "query": {
+          "query_string": "SELECT _change_type, COUNT(*) as change_count, current_timestamp() as audit_timestamp FROM table_changes('{{job.parameters.target_table}}', (SELECT MAX(version) FROM (DESCRIBE HISTORY {{job.parameters.target_table}}))) GROUP BY _change_type ORDER BY _change_type"
+        },
+        "warehouse_id": "WAREHOUSE_ID_PLACEHOLDER"
+      },
+      "timeout_seconds": 300,
+      "max_retries": 0
+    }
+  ],
+
+  "job_clusters": [
+    {
+      "job_cluster_key": "cdc_cluster",
+      "_comment": "Cluster sized for CDC workload with 8 partitions (matching Ab Initio partition count).",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "Standard_DS3_v2",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "16",
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.databricks.delta.properties.defaults.enableChangeDataFeed": "true"
+        },
+        "custom_tags": {
+          "pipeline": "customer_cdc",
+          "migrated_from": "ab_initio"
+        }
+      }
+    }
+  ],
+
+  "email_notifications": {
+    "on_failure": ["data-engineering@company.com"],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true,
+    "_comment": "Replaces Slack webhook alerts from Ab Initio JobMonitor._send_alert()"
+  },
+
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "WEBHOOK_ID_PLACEHOLDER",
+        "_comment": "Configure Slack/PagerDuty webhook for failure alerts"
+      }
+    ]
+  },
+
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 5400,
+
+  "health": {
+    "rules": [
+      {
+        "metric": "RUN_DURATION_SECONDS",
+        "op": "GREATER_THAN",
+        "value": 3600,
+        "_comment": "Alert if pipeline takes >60 minutes (SLA breach detection)"
+      }
+    ]
+  }
+}

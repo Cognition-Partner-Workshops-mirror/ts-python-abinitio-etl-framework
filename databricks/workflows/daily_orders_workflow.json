@@ -1,0 +1,227 @@
+{
+  "_comment": [
+    "Databricks Workflow definition for Daily Orders Pipeline.",
+    "Migrated from: scripts/run_daily_orders.ksh",
+    "Original trigger: AutoSys job JOB_DAILY_ORDERS_LOAD",
+    "",
+    "Ab Initio -> Databricks Mapping:",
+    "  run_daily_orders.ksh           -> This workflow JSON definition",
+    "  AutoSys JOB_DAILY_ORDERS_LOAD  -> Databricks cron schedule (daily 02:00 UTC)",
+    "  air sandbox run (4 phases)     -> 4 notebook tasks with linear dependencies",
+    "  PSET parameters                -> job_parameters (resolved at runtime)",
+    "  setenv.ksh environment vars    -> Databricks job-level parameters",
+    "  ${LOG_DIR}/run.log             -> Databricks driver logs + task values",
+    "  exit $RC (error propagation)   -> Task dependency on_failure behavior"
+  ],
+  "name": "daily_orders_pipeline",
+  "description": "Daily orders batch pipeline — extract, CDC, staging, production. Migrated from Ab Initio KornShell orchestration (run_daily_orders.ksh).",
+  "tags": {
+    "team": "data-engineering",
+    "source": "ab_initio_migration",
+    "pipeline": "orders",
+    "schedule": "daily",
+    "original_script": "scripts/run_daily_orders.ksh",
+    "original_autosys_job": "JOB_DAILY_ORDERS_LOAD"
+  },
+
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED",
+    "_comment": "Daily at 02:00 UTC. Set to PAUSED for initial deployment — enable after validation."
+  },
+
+  "job_parameters": [
+    {
+      "name": "batch_date",
+      "default": "{{job.start_time.iso_date}}",
+      "_comment": "Equivalent to BATCH_DATE=$(date +%Y-%m-%d) in run_daily_orders.ksh"
+    },
+    {
+      "name": "source_base_path",
+      "default": "abfss://raw@datalake.dfs.core.windows.net/orders",
+      "_comment": "Equivalent to AI_DATA_DIR=/data/raw in setenv.ksh"
+    },
+    {
+      "name": "staging_table",
+      "default": "catalog.staging.orders",
+      "_comment": "Equivalent to PSET TARGET_TABLE in orders_staging.pset"
+    },
+    {
+      "name": "production_table",
+      "default": "catalog.production.orders",
+      "_comment": "Equivalent to production rollover target"
+    },
+    {
+      "name": "partition_count",
+      "default": "4",
+      "_comment": "Equivalent to PSET PARTITION_COUNT / AI_DEFAULT_PARTITIONS in setenv.ksh"
+    },
+    {
+      "name": "batch_size",
+      "default": "50000",
+      "_comment": "Equivalent to PSET BATCH_SIZE in orders_pipeline.pset"
+    },
+    {
+      "name": "max_errors",
+      "default": "100",
+      "_comment": "Equivalent to PSET MAX_ERRORS / AI_MAX_ERRORS in setenv.ksh"
+    }
+  ],
+
+  "tasks": [
+    {
+      "task_key": "extract_orders",
+      "_comment": [
+        "Phase 1: Source extraction.",
+        "Ab Initio equivalent: air sandbox run ${GRAPH_DIR}/extract_orders.mp",
+        "Uses parallel_loader notebook with append mode for raw extraction."
+      ],
+      "description": "Phase 1: Extract orders from source systems into bronze layer",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_base_path}}/{{job.parameters.batch_date}}",
+          "target_table": "catalog.bronze.order_items",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "file_format": "csv",
+          "load_mode": "append"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "retry_on_timeout": true
+    },
+    {
+      "task_key": "cdc_orders",
+      "_comment": [
+        "Phase 2: CDC detection.",
+        "Ab Initio equivalent: air sandbox run ${GRAPH_DIR}/cdc_orders.mp -partition 4",
+        "Uses cdc_processor notebook with Delta Lake MERGE."
+      ],
+      "description": "Phase 2: CDC processing — detect inserts/updates/deletes",
+      "depends_on": [
+        {"task_key": "extract_orders"}
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "catalog.bronze.order_items",
+          "target_table": "{{job.parameters.staging_table}}",
+          "key_columns": "order_id",
+          "hash_columns": "item_count,order_status",
+          "enable_deletes": "false",
+          "file_format": "delta"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "load_staging",
+      "_comment": [
+        "Phase 3: Staging load.",
+        "Ab Initio equivalent: air sandbox run ${GRAPH_DIR}/load_staging_orders.mp",
+        "Validates and promotes data from bronze to staging (silver) layer."
+      ],
+      "description": "Phase 3: Validate and promote to staging (silver) layer",
+      "depends_on": [
+        {"task_key": "cdc_orders"}
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.staging_table}}",
+          "target_table": "catalog.silver.orders_validated",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "file_format": "delta",
+          "load_mode": "overwrite"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "production_rollover",
+      "_comment": [
+        "Phase 4: Production load.",
+        "Ab Initio equivalent: air sandbox run ${GRAPH_DIR}/prod_rollover_orders.mp",
+        "Final promotion from silver to gold/production layer."
+      ],
+      "description": "Phase 4: Production rollover — promote to gold layer",
+      "depends_on": [
+        {"task_key": "load_staging"}
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "catalog.silver.orders_validated",
+          "target_table": "{{job.parameters.production_table}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "file_format": "delta",
+          "load_mode": "overwrite"
+        }
+      },
+      "job_cluster_key": "etl_cluster",
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    }
+  ],
+
+  "job_clusters": [
+    {
+      "job_cluster_key": "etl_cluster",
+      "_comment": "Shared cluster for all tasks. Sized to match Ab Initio's 4-partition default.",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "Standard_DS3_v2",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "8",
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true"
+        },
+        "custom_tags": {
+          "pipeline": "daily_orders",
+          "migrated_from": "ab_initio"
+        }
+      }
+    }
+  ],
+
+  "email_notifications": {
+    "on_failure": ["data-engineering@company.com"],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true,
+    "_comment": "Replaces Slack webhook alerts from Ab Initio JobMonitor._send_alert()"
+  },
+
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "WEBHOOK_ID_PLACEHOLDER",
+        "_comment": "Configure Slack/PagerDuty webhook ID for failure alerts"
+      }
+    ]
+  },
+
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 7200,
+
+  "health": {
+    "rules": [
+      {
+        "metric": "RUN_DURATION_SECONDS",
+        "op": "GREATER_THAN",
+        "value": 5400,
+        "_comment": "Alert if pipeline takes >90 minutes (SLA breach detection)"
+      }
+    ]
+  }
+}
