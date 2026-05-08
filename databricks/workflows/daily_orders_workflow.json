@@ -1,0 +1,208 @@
+{
+  "_comment": [
+    "Databricks Workflow — Daily Orders Pipeline",
+    "Migrated from: scripts/run_daily_orders.ksh",
+    "Original trigger: AutoSys job JOB_DAILY_ORDERS_LOAD",
+    "",
+    "Ab Initio pipeline phases mapped to Databricks tasks:",
+    "  Phase 1: air sandbox run extract_orders.mp     → task: extract_orders",
+    "  Phase 2: air sandbox run cdc_orders.mp          → task: cdc_orders",
+    "  Phase 3: air sandbox run load_staging_orders.mp  → task: load_staging",
+    "  Phase 4: air sandbox run prod_rollover_orders.mp → task: load_production",
+    "",
+    "PSET parameters mapped to Databricks job parameters:",
+    "  SOURCE_PATH      → {{source_path}}",
+    "  TARGET_TABLE      → {{target_table}}",
+    "  PARTITION_COUNT   → {{partition_count}}",
+    "  BATCH_DATE        → {{batch_date}}",
+    "  MAX_ERRORS        → {{max_errors}}",
+    "  BATCH_SIZE        → {{batch_size}}"
+  ],
+  "name": "daily_orders_pipeline",
+  "description": "Daily orders ETL pipeline — extract, CDC, staging, production load. Migrated from Ab Initio KornShell orchestration (run_daily_orders.ksh).",
+  "tags": {
+    "team": "data-engineering",
+    "source_system": "abinitio",
+    "pipeline": "orders",
+    "migrated_from": "run_daily_orders.ksh"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED",
+    "_comment": "Daily at 02:00 UTC — matches original AutoSys JOB_DAILY_ORDERS_LOAD schedule"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 7200,
+  "job_clusters": [
+    {
+      "job_cluster_key": "etl_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "{{partition_count}}",
+          "spark.databricks.delta.properties.defaults.enableChangeDataFeed": "true",
+          "spark.sql.files.maxRecordsPerFile": "{{batch_size}}"
+        },
+        "custom_tags": {
+          "pipeline": "daily_orders",
+          "cost_center": "data-engineering"
+        }
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/orders",
+      "_comment": "Maps to Ab Initio PSET: SOURCE_PATH=/data/dev/raw/orders"
+    },
+    {
+      "name": "target_table",
+      "default": "catalog.gold.orders",
+      "_comment": "Maps to Ab Initio PSET: TARGET_TABLE=DEV.STAGING.ORDERS"
+    },
+    {
+      "name": "staging_table",
+      "default": "catalog.silver.orders_staging",
+      "_comment": "Maps to Ab Initio PSET: TARGET_TABLE=STAGING.ORDERS"
+    },
+    {
+      "name": "partition_count",
+      "default": "4",
+      "_comment": "Maps to Ab Initio PSET: PARTITION_COUNT=4 and AI_DEFAULT_PARTITIONS"
+    },
+    {
+      "name": "batch_date",
+      "default": "{{job.start_time.iso_date}}",
+      "_comment": "Maps to Ab Initio: BATCH_DATE=$(date +%Y-%m-%d)"
+    },
+    {
+      "name": "batch_size",
+      "default": "50000",
+      "_comment": "Maps to Ab Initio PSET: BATCH_SIZE=50000"
+    },
+    {
+      "name": "max_errors",
+      "default": "100",
+      "_comment": "Maps to Ab Initio PSET: MAX_ERRORS=100 and AI_ERROR_ACTION=ABORT"
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "extract_orders",
+      "description": "Phase 1: Extract from source systems. Replaces: air sandbox run extract_orders.mp",
+      "job_cluster_key": "etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "{{job.parameters.staging_table}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "batch_date": "{{job.parameters.batch_date}}",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["data-engineering@company.com"]
+      }
+    },
+    {
+      "task_key": "cdc_orders",
+      "description": "Phase 2: CDC detection via Delta MERGE. Replaces: air sandbox run cdc_orders.mp -partition 4",
+      "depends_on": [
+        {"task_key": "extract_orders"}
+      ],
+      "job_cluster_key": "etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "{{job.parameters.staging_table}}",
+          "target_table": "catalog.silver.orders_cdc",
+          "key_columns": "order_id",
+          "compare_columns": "",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "audit_table": "catalog.audit.orders_cdc_log",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "load_staging",
+      "description": "Phase 3: Load to staging tables. Replaces: air sandbox run load_staging_orders.mp",
+      "depends_on": [
+        {"task_key": "cdc_orders"}
+      ],
+      "job_cluster_key": "etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "catalog.silver.orders_cdc",
+          "target_table": "{{job.parameters.staging_table}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "batch_date": "{{job.parameters.batch_date}}",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "load_production",
+      "description": "Phase 4: Production rollover. Replaces: air sandbox run prod_rollover_orders.mp",
+      "depends_on": [
+        {"task_key": "load_staging"}
+      ],
+      "job_cluster_key": "etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.staging_table}}",
+          "target_table": "{{job.parameters.target_table}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "batch_size": "{{job.parameters.batch_size}}",
+          "max_errors": "{{job.parameters.max_errors}}",
+          "batch_date": "{{job.parameters.batch_date}}",
+          "log_level": "INFO"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "email_notifications": {
+        "on_success": ["data-engineering@company.com"],
+        "on_failure": ["data-engineering@company.com", "oncall@company.com"]
+      }
+    }
+  ],
+  "email_notifications": {
+    "on_start": [],
+    "on_success": ["data-engineering@company.com"],
+    "on_failure": ["data-engineering@company.com", "oncall@company.com"],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack_data_alerts",
+        "_comment": "Replaces Ab Initio Slack webhook alerts from job_monitor.py"
+      }
+    ]
+  }
+}
