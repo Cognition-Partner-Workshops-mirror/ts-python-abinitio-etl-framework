@@ -1,0 +1,211 @@
+{
+  "_migration_metadata": {
+    "source_script": "scripts/run_daily_orders.ksh",
+    "source_trigger": "AutoSys job: JOB_DAILY_ORDERS_LOAD",
+    "source_schedule": "Daily",
+    "description": "Daily orders pipeline — extract → CDC → staging → production load",
+    "pset_sources": [
+      "psets/pset_templates/orders_pipeline.pset",
+      "psets/pset_templates/orders_staging.pset"
+    ],
+    "migration_notes": [
+      "4 sequential air_run phases mapped to 4 Databricks tasks with depends_on",
+      "PSET parameters mapped to job-level parameters + per-task base_parameters",
+      "set -e error handling mapped to task-level error routing",
+      "BATCH_DATE parameter auto-resolved via {{job.start_time.iso_date}}",
+      "air sandbox run → notebook_task execution on shared job cluster",
+      "tee logging → Databricks job run logs (automatic)"
+    ]
+  },
+
+  "name": "daily_orders_pipeline",
+  "description": "Daily orders ETL pipeline — migrated from Ab Initio run_daily_orders.ksh (AutoSys: JOB_DAILY_ORDERS_LOAD)",
+
+  "tags": {
+    "team": "data-engineering",
+    "domain": "orders",
+    "migration_source": "abinitio",
+    "legacy_job": "JOB_DAILY_ORDERS_LOAD"
+  },
+
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED",
+    "_migration_note": "Original AutoSys schedule — adjust cron and timezone to match production. Set pause_status to UNPAUSED when ready."
+  },
+
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 7200,
+
+  "job_clusters": [
+    {
+      "job_cluster_key": "orders_etl_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "8"
+        },
+        "custom_tags": {
+          "pipeline": "daily_orders",
+          "cost_center": "data-engineering"
+        },
+        "_migration_note": "Ab Initio used AI_DEFAULT_PARTITIONS=4 (setenv.ksh). Cluster sized for comparable parallelism. Adjust num_workers based on data volume."
+      }
+    }
+  ],
+
+  "parameters": [
+    {
+      "name": "batch_date",
+      "default": "{{job.start_time.iso_date}}",
+      "_migration_note": "Maps to KornShell: BATCH_DATE=$(date +%Y-%m-%d)"
+    },
+    {
+      "name": "source_catalog",
+      "default": "main",
+      "_migration_note": "Unity Catalog name — replaces Ab Initio AI_SOURCE_DB=ORACLE_PROD (setenv.ksh)"
+    },
+    {
+      "name": "target_catalog",
+      "default": "main",
+      "_migration_note": "Unity Catalog name — replaces Ab Initio AI_TARGET_DB=TERADATA_DW (setenv.ksh)"
+    },
+    {
+      "name": "environment",
+      "default": "dev",
+      "_migration_note": "Replaces PSET environment resolution (dev/uat/prod). Controls schema names and paths."
+    },
+    {
+      "name": "max_errors",
+      "default": "100",
+      "_migration_note": "Maps to PSET MAX_ERRORS and setenv.ksh AI_MAX_ERRORS=100"
+    }
+  ],
+
+  "tasks": [
+    {
+      "task_key": "extract_orders",
+      "description": "Phase 1: Extract orders from source systems — replaces air sandbox run extract_orders.mp",
+      "job_cluster_key": "orders_etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "/mnt/{{job.parameters.source_catalog}}/raw/orders/{{job.parameters.batch_date}}",
+          "target_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.orders_extract",
+          "partition_count": "8",
+          "file_format": "csv",
+          "delimiter": ","
+        },
+        "_pset_mapping": {
+          "source_path": "orders_pipeline.pset → SOURCE_PATH (/data/dev/raw/orders)",
+          "target_table": "orders_pipeline.pset → TARGET_TABLE (DEV.STAGING.ORDERS)",
+          "partition_count": "orders_pipeline.pset → PARTITION_COUNT (4, increased to 8 for Spark)",
+          "file_format": "Inferred from Ab Initio DML delimiter metadata"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "retry_on_timeout": true,
+      "_migration_note": "KornShell Phase 1: air sandbox run extract_orders.mp -pset orders_extract.pset -param BATCH_DATE. RC check (if [ $RC -ne 0 ]) mapped to Databricks task failure routing."
+    },
+
+    {
+      "task_key": "cdc_orders",
+      "description": "Phase 2: CDC detection — replaces air sandbox run cdc_orders.mp with -partition 4",
+      "depends_on": [
+        { "task_key": "extract_orders" }
+      ],
+      "job_cluster_key": "orders_etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.orders_extract",
+          "target_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.orders_cdc",
+          "key_columns": "order_id",
+          "compare_columns": "",
+          "file_format": "delta",
+          "enable_cdf": "true",
+          "handle_deletes": "true"
+        },
+        "_pset_mapping": {
+          "source_path": "Reads from extract phase output (was orders_cdc.pset source)",
+          "target_table": "orders_staging.pset → TARGET_TABLE (STAGING.ORDERS)",
+          "key_columns": "Inferred from order_items.dml primary key",
+          "enable_cdf": "New capability — replaces Ab Initio's hash-based CDC output files"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1,
+      "_migration_note": "KornShell Phase 2: air sandbox run cdc_orders.mp -partition 4. The -partition 4 is handled by Spark's native partitioning. CDC detection via Delta MERGE replaces hash comparison."
+    },
+
+    {
+      "task_key": "load_staging",
+      "description": "Phase 3: Load to staging — replaces air sandbox run load_staging_orders.mp",
+      "depends_on": [
+        { "task_key": "cdc_orders" }
+      ],
+      "job_cluster_key": "orders_etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.orders_cdc",
+          "target_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.orders",
+          "partition_count": "8",
+          "file_format": "delta",
+          "delimiter": ","
+        },
+        "_pset_mapping": {
+          "source_path": "Reads CDC output (was orders_staging.pset → SOURCE_PATH)",
+          "target_table": "orders_staging.pset → TARGET_TABLE (STAGING.ORDERS)",
+          "partition_count": "orders_staging.pset → PARTITION_COUNT (4, increased to 8)"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "_migration_note": "KornShell Phase 3: air sandbox run load_staging_orders.mp. LOAD_MODE=MERGE from orders_staging.pset is inherent in Delta MERGE operations. SLA_MINUTES=30 mapped to timeout_seconds=1800."
+    },
+
+    {
+      "task_key": "production_rollover",
+      "description": "Phase 4: Production rollover — replaces air sandbox run prod_rollover_orders.mp",
+      "depends_on": [
+        { "task_key": "load_staging" }
+      ],
+      "job_cluster_key": "orders_etl_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.orders",
+          "target_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_production.orders",
+          "partition_count": "8",
+          "file_format": "delta",
+          "delimiter": ","
+        },
+        "_pset_mapping": {
+          "source_path": "Reads from staging (was orders_prod.pset source)",
+          "target_table": "Production target — replaces AI_TARGET_DB=TERADATA_DW"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 0,
+      "_migration_note": "KornShell Phase 4: air sandbox run prod_rollover_orders.mp. No retries on production writes to prevent duplicates. In Delta Lake, writes are atomic — partial failures don't leave inconsistent state."
+    }
+  ],
+
+  "email_notifications": {
+    "on_failure": [],
+    "on_success": [],
+    "_migration_note": "Add team email addresses. Replaces AutoSys job notifications and Ab Initio error-port alerts."
+  },
+
+  "webhook_notifications": {
+    "on_failure": [],
+    "_migration_note": "Add Slack/PagerDuty webhook URLs. Replaces monitoring/job_monitor.py AutoSys integration."
+  }
+}

@@ -5,3 +5,5 @@ pandas==2.2.2
 python-dotenv==1.0.1
 croniter==2.0.5
 pytest==8.2.2
+# Databricks / PySpark dependencies (for Delta Lake schema definitions)
+pyspark>=3.5.0

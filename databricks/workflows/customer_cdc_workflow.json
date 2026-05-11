@@ -1,0 +1,196 @@
+{
+  "_migration_metadata": {
+    "source_script": "scripts/run_customer_cdc.ksh",
+    "source_trigger": "AutoSys job: JOB_CUSTOMER_CDC",
+    "source_schedule": "Every 4 hours",
+    "description": "Customer CDC pipeline — snapshot → detect changes → apply → audit",
+    "pset_sources": [
+      "psets/pset_templates/customer_cdc.pset"
+    ],
+    "migration_notes": [
+      "4 sequential air_run steps mapped to 4 Databricks tasks with depends_on",
+      "AutoSys 4-hour schedule mapped to Quartz cron: 0 0 0/4 * * ?",
+      "Steps 1+2 (snapshot + detect) collapsed into single MERGE in Databricks",
+      "Step 3 (apply) is implicit in the MERGE — no separate apply phase needed",
+      "Step 4 (audit) mapped to CDF + audit notebook for change tracking",
+      "RUN_TIMESTAMP parameter auto-resolved via {{job.start_time.iso_datetime}}",
+      "8 partitions (-partition 8) handled by Spark native partitioning",
+      "HASH_COLUMNS from customer_cdc.pset mapped to CDC compare_columns widget"
+    ]
+  },
+
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC pipeline (every 4 hours) — migrated from Ab Initio run_customer_cdc.ksh (AutoSys: JOB_CUSTOMER_CDC)",
+
+  "tags": {
+    "team": "data-engineering",
+    "domain": "customer",
+    "migration_source": "abinitio",
+    "legacy_job": "JOB_CUSTOMER_CDC",
+    "frequency": "4h"
+  },
+
+  "schedule": {
+    "quartz_cron_expression": "0 0 0/4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED",
+    "_migration_note": "AutoSys JOB_CUSTOMER_CDC ran every 4 hours. Quartz cron: 0 0 0/4 * * ? = at minute 0 past every 4th hour. Set pause_status to UNPAUSED when ready."
+  },
+
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 3600,
+
+  "job_clusters": [
+    {
+      "job_cluster_key": "customer_cdc_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 4,
+        "spark_conf": {
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.sql.shuffle.partitions": "16"
+        },
+        "custom_tags": {
+          "pipeline": "customer_cdc",
+          "cost_center": "data-engineering"
+        },
+        "_migration_note": "Ab Initio used -partition 8 for CDC detection. shuffle.partitions=16 provides comparable parallelism. Adjust num_workers based on customer table size."
+      }
+    }
+  ],
+
+  "parameters": [
+    {
+      "name": "run_timestamp",
+      "default": "{{job.start_time.iso_datetime}}",
+      "_migration_note": "Maps to KornShell: RUN_TS=$(date +%Y-%m-%d_%H:%M:%S)"
+    },
+    {
+      "name": "source_catalog",
+      "default": "main",
+      "_migration_note": "Unity Catalog — replaces AI_SOURCE_DB=ORACLE_PROD"
+    },
+    {
+      "name": "target_catalog",
+      "default": "main",
+      "_migration_note": "Unity Catalog — replaces AI_TARGET_DB=TERADATA_DW"
+    },
+    {
+      "name": "environment",
+      "default": "dev",
+      "_migration_note": "Replaces PSET environment resolution. Controls schema names."
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id",
+      "_migration_note": "customer_cdc.pset → KEY_COLUMNS (customer_id)"
+    },
+    {
+      "name": "compare_columns",
+      "default": "name,address,phone,email,status",
+      "_migration_note": "customer_cdc.pset → HASH_COLUMNS minus KEY_COLUMNS. In Ab Initio these were MD5-hashed; in Delta MERGE they are compared directly."
+    },
+    {
+      "name": "retention_days",
+      "default": "90",
+      "_migration_note": "customer_cdc.pset → RETENTION_DAYS (90). Used for Delta table history retention."
+    }
+  ],
+
+  "tasks": [
+    {
+      "task_key": "snapshot_customer_source",
+      "description": "Step 1: Snapshot current customer state from source — replaces air sandbox run snapshot_customer.mp",
+      "job_cluster_key": "customer_cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/parallel_loader",
+        "base_parameters": {
+          "source_path": "/mnt/{{job.parameters.source_catalog}}/raw/customer",
+          "target_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.customer_snapshot",
+          "partition_count": "8",
+          "file_format": "csv",
+          "delimiter": ","
+        },
+        "_pset_mapping": {
+          "source_path": "customer_cdc.pset → SOURCE_PATH (/data/raw/customer)",
+          "target_table": "Maps to CURRENT_SNAPSHOT_PATH (/data/snapshots/customer/current) as a Delta table",
+          "partition_count": "customer_cdc.pset → PARTITION_COUNT (8)"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "_migration_note": "KornShell Step 1: air sandbox run snapshot_customer.mp. In Ab Initio, this wrote a flat-file snapshot. In Databricks, we write to a Delta table (customer_snapshot) which serves as the MERGE source."
+    },
+
+    {
+      "task_key": "cdc_detect_and_apply",
+      "description": "Steps 2+3: CDC detection and apply — replaces cdc_detect_customer.mp + apply_customer_changes.mp. Delta MERGE does both in one atomic operation.",
+      "depends_on": [
+        { "task_key": "snapshot_customer_source" }
+      ],
+      "job_cluster_key": "customer_cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_staging.customer_snapshot",
+          "target_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_production.customer_master",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "compare_columns": "{{job.parameters.compare_columns}}",
+          "file_format": "delta",
+          "enable_cdf": "true",
+          "handle_deletes": "true"
+        },
+        "_pset_mapping": {
+          "source_path": "Output of snapshot task (was CURRENT_SNAPSHOT_PATH)",
+          "target_table": "customer_cdc.pset → TARGET_TABLE (STAGING.CUSTOMER_MASTER)",
+          "key_columns": "customer_cdc.pset → KEY_COLUMNS (customer_id)",
+          "compare_columns": "customer_cdc.pset → HASH_COLUMNS minus KEY_COLUMNS. No longer hashed — direct column comparison.",
+          "enable_cdf": "New: Change Data Feed replaces CDC_OUTPUT_PATH flat files",
+          "handle_deletes": "Ab Initio CDCProcessor always detected deletes"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "_migration_note": "Consolidates KornShell Steps 2 + 3. In Ab Initio, Step 2 (cdc_detect) produced separate INSERT/UPDATE/DELETE files, then Step 3 (apply_changes) loaded them. Delta MERGE does detection + apply atomically in one statement."
+    },
+
+    {
+      "task_key": "audit_customer_changes",
+      "description": "Step 4: Generate audit trail from CDF — replaces air sandbox run audit_customer_changes.mp",
+      "depends_on": [
+        { "task_key": "cdc_detect_and_apply" }
+      ],
+      "job_cluster_key": "customer_cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/databricks/notebooks/cdc_audit",
+        "base_parameters": {
+          "source_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_production.customer_master",
+          "audit_table": "{{job.parameters.target_catalog}}.{{job.parameters.environment}}_audit.customer_changes",
+          "run_timestamp": "{{job.parameters.run_timestamp}}",
+          "retention_days": "{{job.parameters.retention_days}}"
+        },
+        "_pset_mapping": {
+          "source_table": "Reads CDF from customer_master (replaces CDC_OUTPUT_PATH flat files)",
+          "audit_table": "customer_cdc.pset → AUDIT_TABLE (AUDIT.CUSTOMER_CHANGES)",
+          "retention_days": "customer_cdc.pset → RETENTION_DAYS (90)"
+        }
+      },
+      "timeout_seconds": 900,
+      "max_retries": 1,
+      "_migration_note": "KornShell Step 4: audit_customer_changes.mp. In Ab Initio, this read CDC output files. In Databricks, it reads Change Data Feed (CDF) from the customer_master Delta table. The cdc_audit notebook (to be implemented) uses CDCProcessor.read_changes() to query CDF and write to the audit table."
+    }
+  ],
+
+  "email_notifications": {
+    "on_failure": [],
+    "on_success": [],
+    "_migration_note": "Add team email addresses. Replaces AutoSys job notifications."
+  },
+
+  "webhook_notifications": {
+    "on_failure": [],
+    "_migration_note": "Add Slack/PagerDuty webhook URLs. Replaces monitoring/job_monitor.py alerts."
+  }
+}
