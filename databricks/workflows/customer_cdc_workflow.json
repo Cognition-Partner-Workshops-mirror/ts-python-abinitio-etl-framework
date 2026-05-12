@@ -1,0 +1,168 @@
+{
+  "_comment": [
+    "Databricks Workflow definition for the customer CDC pipeline.",
+    "Migrated from: scripts/run_customer_cdc.ksh",
+    "",
+    "Original KornShell pipeline steps:",
+    "  Step 1: air sandbox run snapshot_customer.mp     → handled by source read in cdc_processor",
+    "  Step 2: air sandbox run cdc_detect_customer.mp   → Task: cdc_detect (Delta MERGE)",
+    "  Step 3: air sandbox run apply_customer_changes.mp → Task: cdc_detect (Delta MERGE handles apply)",
+    "  Step 4: air sandbox run audit_customer_changes.mp → Task: audit_changes (CDF query)",
+    "",
+    "Original AutoSys job name: JOB_CUSTOMER_CDC",
+    "Original schedule: Every 4 hours",
+    "",
+    "PSET parameter mapping (from customer_cdc.pset):",
+    "  PSET: SOURCE_PATH              → job_parameter: source_path",
+    "  PSET: TARGET_TABLE              → job_parameter: target_table",
+    "  PSET: KEY_COLUMNS               → job_parameter: key_columns",
+    "  PSET: HASH_COLUMNS              → job_parameter: hash_columns",
+    "  PSET: PARTITION_COUNT            → job_parameter: partition_count",
+    "  PSET: MAX_ERRORS                 → job_parameter: max_errors",
+    "  PSET: AUDIT_TABLE                → job_parameter: audit_table",
+    "  PSET: RETENTION_DAYS             → job_parameter: retention_days",
+    "  PSET: PREVIOUS/CURRENT_SNAPSHOT  → not needed (Delta Lake handles snapshots via versioning)"
+  ],
+  "name": "customer_cdc_pipeline",
+  "description": "Customer CDC pipeline — runs every 4 hours to detect and apply customer master changes. Migrated from Ab Initio KornShell orchestration (scripts/run_customer_cdc.ksh).",
+  "tags": {
+    "team": "data-engineering",
+    "source": "abinitio-migration",
+    "legacy_job": "JOB_CUSTOMER_CDC",
+    "pipeline": "customer"
+  },
+  "schedule": {
+    "quartz_cron_expression": "0 0 0/4 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED",
+    "_comment": "Runs every 4 hours — matches original AutoSys schedule for JOB_CUSTOMER_CDC"
+  },
+  "max_concurrent_runs": 1,
+  "timeout_seconds": 3600,
+  "job_clusters": [
+    {
+      "job_cluster_key": "cdc_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 8,
+        "spark_conf": {
+          "spark.sql.shuffle.partitions": "16",
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true"
+        },
+        "custom_tags": {
+          "pipeline": "customer_cdc",
+          "cost_center": "data-engineering"
+        },
+        "_comment": "8 workers matches the original Ab Initio PARTITION_COUNT=8 from customer_cdc.pset"
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "source_path",
+      "default": "/mnt/raw/customer",
+      "_pset_source": "customer_cdc.pset → SOURCE_PATH"
+    },
+    {
+      "name": "target_table",
+      "default": "catalog.bronze.customer_master",
+      "_pset_source": "customer_cdc.pset → TARGET_TABLE (STAGING.CUSTOMER_MASTER)"
+    },
+    {
+      "name": "key_columns",
+      "default": "customer_id",
+      "_pset_source": "customer_cdc.pset → KEY_COLUMNS"
+    },
+    {
+      "name": "hash_columns",
+      "default": "customer_id,name,address,phone,email,status",
+      "_pset_source": "customer_cdc.pset → HASH_COLUMNS"
+    },
+    {
+      "name": "partition_count",
+      "default": "8",
+      "_pset_source": "customer_cdc.pset → PARTITION_COUNT"
+    },
+    {
+      "name": "max_errors",
+      "default": "50",
+      "_pset_source": "customer_cdc.pset → MAX_ERRORS"
+    },
+    {
+      "name": "audit_table",
+      "default": "catalog.audit.customer_changes",
+      "_pset_source": "customer_cdc.pset → AUDIT_TABLE"
+    },
+    {
+      "name": "retention_days",
+      "default": "90",
+      "_pset_source": "customer_cdc.pset → RETENTION_DAYS"
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "cdc_detect",
+      "description": "Steps 1-3: Snapshot + CDC detect + apply changes. Replaces snapshot_customer.mp + cdc_detect_customer.mp + apply_customer_changes.mp. Delta Lake MERGE handles all three operations atomically.",
+      "job_cluster_key": "cdc_cluster",
+      "notebook_task": {
+        "notebook_path": "/Repos/data-engineering/abinitio-migration/databricks/notebooks/cdc_processor",
+        "base_parameters": {
+          "source_path": "{{job.parameters.source_path}}",
+          "target_table": "{{job.parameters.target_table}}",
+          "key_columns": "{{job.parameters.key_columns}}",
+          "hash_columns": "{{job.parameters.hash_columns}}",
+          "partition_count": "{{job.parameters.partition_count}}",
+          "max_errors": "{{job.parameters.max_errors}}"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "audit_changes",
+      "description": "Step 4: Generate audit trail. Replaces: audit_customer_changes.mp. Uses Delta Change Data Feed (CDF) to log all CDC operations to the audit table.",
+      "depends_on": [
+        {"task_key": "cdc_detect"}
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "sql_task": {
+        "query": {
+          "query_string": "INSERT INTO {{job.parameters.audit_table}} SELECT *, current_timestamp() AS audit_timestamp FROM table_changes('{{job.parameters.target_table}}', (SELECT MAX(version) - 1 FROM (DESCRIBE HISTORY {{job.parameters.target_table}})))"
+        },
+        "warehouse_id": "auto"
+      },
+      "timeout_seconds": 600
+    },
+    {
+      "task_key": "cleanup_old_records",
+      "description": "Housekeeping: Purge audit records older than RETENTION_DAYS. Replaces the RETENTION_DAYS=90 PSET parameter enforcement.",
+      "depends_on": [
+        {"task_key": "audit_changes"}
+      ],
+      "job_cluster_key": "cdc_cluster",
+      "sql_task": {
+        "query": {
+          "query_string": "DELETE FROM {{job.parameters.audit_table}} WHERE audit_timestamp < current_timestamp() - INTERVAL {{job.parameters.retention_days}} DAYS"
+        },
+        "warehouse_id": "auto"
+      },
+      "timeout_seconds": 300
+    }
+  ],
+  "email_notifications": {
+    "on_failure": ["data-engineering-alerts@company.com"],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack_webhook_id",
+        "_comment": "Replaces Ab Initio JobMonitor._send_alert() Slack webhook"
+      }
+    ]
+  }
+}
