@@ -1,0 +1,169 @@
+{
+    "_comment": "Converted from: scripts/run_customer_cdc.ksh — AutoSys job JOB_CUSTOMER_CDC (runs every 4 hours)",
+    "_mapping": {
+        "4-hour AutoSys schedule": "Databricks cron trigger every 4 hours",
+        "Step 1: snapshot_customer.mp": "Task: snapshot_customer — parallel_loader notebook",
+        "Step 2: cdc_detect_customer.mp -partition 8": "Task: cdc_detection — cdc_processor notebook",
+        "Step 3: apply_customer_changes.mp": "Task: apply_changes — cdc_processor MERGE",
+        "Step 4: audit_customer_changes.mp": "Task: generate_audit — Change Data Feed query",
+        "PSET customer_cdc.pset parameters": "Databricks job parameters",
+        "RUN_TIMESTAMP": "Automatic via job run start time"
+    },
+    "name": "customer_cdc_pipeline",
+    "description": "Customer CDC pipeline — snapshot → detect changes → apply → audit. Migrated from Ab Initio KornShell orchestration (run_customer_cdc.ksh) triggered by AutoSys JOB_CUSTOMER_CDC every 4 hours.",
+    "tags": {
+        "team": "data-engineering",
+        "source_system": "abinitio",
+        "migration_source": "run_customer_cdc.ksh",
+        "pipeline_type": "cdc",
+        "schedule": "every-4-hours"
+    },
+    "schedule": {
+        "_comment": "Original: AutoSys JOB_CUSTOMER_CDC runs every 4 hours",
+        "quartz_cron_expression": "0 0 0/4 * * ?",
+        "timezone_id": "UTC",
+        "pause_status": "PAUSED"
+    },
+    "job_clusters": [
+        {
+            "job_cluster_key": "cdc_cluster",
+            "new_cluster": {
+                "spark_version": "14.3.x-scala2.12",
+                "node_type_id": "Standard_DS3_v2",
+                "num_workers": 8,
+                "_comment": "8 workers maps to -partition 8 in cdc_detect_customer.mp and PSET PARTITION_COUNT=8"
+            }
+        }
+    ],
+    "parameters": [
+        {
+            "name": "source_path",
+            "default": "/mnt/raw/customer",
+            "_comment": "Maps to PSET SOURCE_PATH=/data/raw/customer from customer_cdc.pset"
+        },
+        {
+            "name": "target_table",
+            "default": "lakehouse.bronze.customer",
+            "_comment": "Maps to PSET TARGET_TABLE=STAGING.CUSTOMER_MASTER"
+        },
+        {
+            "name": "key_columns",
+            "default": "customer_id",
+            "_comment": "Maps to PSET KEY_COLUMNS=customer_id"
+        },
+        {
+            "name": "hash_columns",
+            "default": "customer_id,name,address,phone,email,status",
+            "_comment": "Maps to PSET HASH_COLUMNS from customer_cdc.pset"
+        },
+        {
+            "name": "partition_count",
+            "default": "8",
+            "_comment": "Maps to PSET PARTITION_COUNT=8 and -partition 8 in KornShell"
+        },
+        {
+            "name": "batch_size",
+            "default": "100000",
+            "_comment": "Maps to PSET BATCH_SIZE=100000"
+        },
+        {
+            "name": "max_errors",
+            "default": "50",
+            "_comment": "Maps to PSET MAX_ERRORS=50"
+        },
+        {
+            "name": "retention_days",
+            "default": "90",
+            "_comment": "Maps to PSET RETENTION_DAYS=90 — Delta Lake VACUUM interval"
+        }
+    ],
+    "tasks": [
+        {
+            "_comment": "Step 1 from KornShell: air sandbox run snapshot_customer.mp -pset customer_snapshot.pset",
+            "task_key": "snapshot_customer",
+            "description": "Step 1: Snapshot current state from source. Replaces: air sandbox run ${GRAPH_DIR}/snapshot_customer.mp",
+            "job_cluster_key": "cdc_cluster",
+            "notebook_task": {
+                "notebook_path": "/Repos/data-engineering/databricks/notebooks/parallel_loader",
+                "base_parameters": {
+                    "source_path": "{{job.parameters.source_path}}",
+                    "target_table": "lakehouse.staging.customer_snapshot",
+                    "partition_count": "{{job.parameters.partition_count}}",
+                    "file_format": "csv",
+                    "max_errors": "{{job.parameters.max_errors}}",
+                    "load_mode": "overwrite"
+                }
+            },
+            "timeout_seconds": 1800,
+            "max_retries": 1
+        },
+        {
+            "_comment": "Steps 2+3 from KornShell: cdc_detect_customer.mp + apply_customer_changes.mp combined into Delta MERGE",
+            "task_key": "cdc_detect_and_apply",
+            "description": "Steps 2-3: Detect changes and apply via Delta MERGE. Replaces: cdc_detect_customer.mp (-partition 8) + apply_customer_changes.mp",
+            "depends_on": [
+                {
+                    "task_key": "snapshot_customer"
+                }
+            ],
+            "job_cluster_key": "cdc_cluster",
+            "notebook_task": {
+                "notebook_path": "/Repos/data-engineering/databricks/notebooks/cdc_processor",
+                "base_parameters": {
+                    "source_path": "lakehouse.staging.customer_snapshot",
+                    "target_table": "{{job.parameters.target_table}}",
+                    "key_columns": "{{job.parameters.key_columns}}",
+                    "compare_columns": "{{job.parameters.hash_columns}}",
+                    "partition_count": "{{job.parameters.partition_count}}",
+                    "enable_deletes": "true"
+                }
+            },
+            "timeout_seconds": 3600,
+            "max_retries": 1
+        },
+        {
+            "_comment": "Step 4 from KornShell: air sandbox run audit_customer_changes.mp — replaced by Delta Change Data Feed query",
+            "task_key": "generate_audit_trail",
+            "description": "Step 4: Generate audit trail. Replaces: air sandbox run ${GRAPH_DIR}/audit_customer_changes.mp. Uses Delta Lake Change Data Feed instead of a separate audit graph.",
+            "depends_on": [
+                {
+                    "task_key": "cdc_detect_and_apply"
+                }
+            ],
+            "job_cluster_key": "cdc_cluster",
+            "sql_task": {
+                "query": {
+                    "query_string": "INSERT INTO lakehouse.audit.customer_changes SELECT *, current_timestamp() AS audit_timestamp FROM table_changes('lakehouse.bronze.customer', (SELECT MAX(version) - 1 FROM (DESCRIBE HISTORY lakehouse.bronze.customer LIMIT 2)))"
+                },
+                "warehouse_id": "{{warehouse_id}}"
+            },
+            "timeout_seconds": 600,
+            "max_retries": 0
+        },
+        {
+            "_comment": "Cleanup — equivalent to RETENTION_DAYS=90 in customer_cdc.pset",
+            "task_key": "vacuum_old_versions",
+            "description": "Cleanup: VACUUM old Delta versions. Maps to PSET RETENTION_DAYS=90.",
+            "depends_on": [
+                {
+                    "task_key": "generate_audit_trail"
+                }
+            ],
+            "job_cluster_key": "cdc_cluster",
+            "sql_task": {
+                "query": {
+                    "query_string": "VACUUM lakehouse.bronze.customer RETAIN 2160 HOURS"
+                },
+                "warehouse_id": "{{warehouse_id}}"
+            },
+            "timeout_seconds": 600,
+            "max_retries": 0
+        }
+    ],
+    "email_notifications": {
+        "on_failure": ["data-engineering-alerts@company.com"],
+        "_comment": "Replaces KornShell exit code propagation + AutoSys failure notification"
+    },
+    "max_concurrent_runs": 1,
+    "_comment_max_concurrent": "Equivalent to AutoSys mutual exclusion — prevent overlapping CDC runs"
+}

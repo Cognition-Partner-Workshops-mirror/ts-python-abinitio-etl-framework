@@ -1,0 +1,164 @@
+{
+    "_comment": "Converted from: scripts/run_daily_orders.ksh — AutoSys job JOB_DAILY_ORDERS_LOAD",
+    "_mapping": {
+        "Ab Initio KornShell phases": "Databricks workflow tasks with dependencies",
+        "air sandbox run": "Databricks notebook task execution",
+        "PSET parameters": "Databricks job parameters and widget defaults",
+        "AutoSys schedule": "Databricks cron trigger",
+        "LOG_DIR with tee": "Databricks built-in job run logs",
+        "set -e (fail-fast)": "Task dependency chain — downstream tasks skip on failure"
+    },
+    "name": "daily_orders_pipeline",
+    "description": "Daily orders pipeline — extract → CDC → staging → production. Migrated from Ab Initio KornShell orchestration (run_daily_orders.ksh) triggered by AutoSys job JOB_DAILY_ORDERS_LOAD.",
+    "tags": {
+        "team": "data-engineering",
+        "source_system": "abinitio",
+        "migration_source": "run_daily_orders.ksh",
+        "pipeline_type": "batch"
+    },
+    "schedule": {
+        "_comment": "Original: AutoSys JOB_DAILY_ORDERS_LOAD — daily batch schedule",
+        "quartz_cron_expression": "0 0 2 * * ?",
+        "timezone_id": "UTC",
+        "pause_status": "PAUSED"
+    },
+    "job_clusters": [
+        {
+            "job_cluster_key": "etl_cluster",
+            "new_cluster": {
+                "spark_version": "14.3.x-scala2.12",
+                "node_type_id": "Standard_DS3_v2",
+                "num_workers": 4,
+                "_comment": "4 workers maps to Ab Initio AI_DEFAULT_PARTITIONS=4 from setenv.ksh"
+            }
+        }
+    ],
+    "parameters": [
+        {
+            "name": "batch_date",
+            "default": "",
+            "_comment": "Maps to BATCH_DATE=$(date +%Y-%%m-%%d) in KornShell script. Empty = today."
+        },
+        {
+            "name": "partition_count",
+            "default": "4",
+            "_comment": "Maps to -partition 4 in Phase 2 CDC air sandbox run command"
+        },
+        {
+            "name": "max_errors",
+            "default": "100",
+            "_comment": "Maps to PSET MAX_ERRORS=100 from orders_pipeline.pset"
+        },
+        {
+            "name": "source_path",
+            "default": "/mnt/raw/orders",
+            "_comment": "Maps to PSET SOURCE_PATH from orders_pipeline.pset"
+        },
+        {
+            "name": "target_table",
+            "default": "lakehouse.bronze.orders",
+            "_comment": "Maps to PSET TARGET_TABLE from orders_pipeline.pset"
+        }
+    ],
+    "tasks": [
+        {
+            "_comment": "Phase 1 from KornShell: air sandbox run extract_orders.mp -pset orders_extract.pset",
+            "task_key": "extract_orders",
+            "description": "Phase 1: Extract from source systems. Replaces: air sandbox run ${GRAPH_DIR}/extract_orders.mp",
+            "job_cluster_key": "etl_cluster",
+            "notebook_task": {
+                "notebook_path": "/Repos/data-engineering/databricks/notebooks/parallel_loader",
+                "base_parameters": {
+                    "source_path": "{{job.parameters.source_path}}",
+                    "target_table": "lakehouse.staging.orders_extract",
+                    "partition_count": "{{job.parameters.partition_count}}",
+                    "batch_date": "{{job.parameters.batch_date}}",
+                    "file_format": "csv",
+                    "max_errors": "{{job.parameters.max_errors}}",
+                    "load_mode": "overwrite"
+                }
+            },
+            "timeout_seconds": 3600,
+            "max_retries": 1,
+            "retry_on_timeout": false
+        },
+        {
+            "_comment": "Phase 2 from KornShell: air sandbox run cdc_orders.mp -pset orders_cdc.pset -partition 4",
+            "task_key": "cdc_processing",
+            "description": "Phase 2: CDC detection. Replaces: air sandbox run ${GRAPH_DIR}/cdc_orders.mp with -partition 4",
+            "depends_on": [
+                {
+                    "task_key": "extract_orders"
+                }
+            ],
+            "job_cluster_key": "etl_cluster",
+            "notebook_task": {
+                "notebook_path": "/Repos/data-engineering/databricks/notebooks/cdc_processor",
+                "base_parameters": {
+                    "source_path": "lakehouse.staging.orders_extract",
+                    "target_table": "lakehouse.bronze.orders",
+                    "key_columns": "order_id",
+                    "batch_date": "{{job.parameters.batch_date}}",
+                    "partition_count": "{{job.parameters.partition_count}}",
+                    "enable_deletes": "false"
+                }
+            },
+            "timeout_seconds": 3600,
+            "max_retries": 1
+        },
+        {
+            "_comment": "Phase 3 from KornShell: air sandbox run load_staging_orders.mp -pset orders_staging.pset",
+            "task_key": "staging_load",
+            "description": "Phase 3: Load to staging. Replaces: air sandbox run ${GRAPH_DIR}/load_staging_orders.mp",
+            "depends_on": [
+                {
+                    "task_key": "cdc_processing"
+                }
+            ],
+            "job_cluster_key": "etl_cluster",
+            "notebook_task": {
+                "notebook_path": "/Repos/data-engineering/databricks/notebooks/parallel_loader",
+                "base_parameters": {
+                    "source_path": "lakehouse.bronze.orders",
+                    "target_table": "lakehouse.silver.orders_staging",
+                    "partition_count": "{{job.parameters.partition_count}}",
+                    "batch_date": "{{job.parameters.batch_date}}",
+                    "file_format": "delta",
+                    "load_mode": "overwrite"
+                }
+            },
+            "timeout_seconds": 1800,
+            "max_retries": 1
+        },
+        {
+            "_comment": "Phase 4 from KornShell: air sandbox run prod_rollover_orders.mp -pset orders_prod.pset",
+            "task_key": "production_load",
+            "description": "Phase 4: Production rollover. Replaces: air sandbox run ${GRAPH_DIR}/prod_rollover_orders.mp",
+            "depends_on": [
+                {
+                    "task_key": "staging_load"
+                }
+            ],
+            "job_cluster_key": "etl_cluster",
+            "notebook_task": {
+                "notebook_path": "/Repos/data-engineering/databricks/notebooks/parallel_loader",
+                "base_parameters": {
+                    "source_path": "lakehouse.silver.orders_staging",
+                    "target_table": "lakehouse.gold.orders",
+                    "partition_count": "{{job.parameters.partition_count}}",
+                    "batch_date": "{{job.parameters.batch_date}}",
+                    "file_format": "delta",
+                    "load_mode": "merge"
+                }
+            },
+            "timeout_seconds": 1800,
+            "max_retries": 1
+        }
+    ],
+    "email_notifications": {
+        "on_failure": ["data-engineering-alerts@company.com"],
+        "_comment": "Replaces Ab Initio exit code checks + AutoSys failure alerting"
+    },
+    "max_concurrent_runs": 1,
+    "_comment_max_concurrent": "Equivalent to AutoSys job exclusion — only one daily run at a time"
+}
