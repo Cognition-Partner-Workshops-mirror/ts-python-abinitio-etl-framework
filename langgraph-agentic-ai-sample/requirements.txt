@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────
+# LangGraph Agentic AI Sample — Python Dependencies
+# Install with:  pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────
+
+# LangGraph — Graph-based agentic workflow orchestration
+langgraph==0.4.1
+
+# LangChain core — Foundation library for LLM applications
+langchain==0.3.25
+
+# LangChain OpenAI integration — ChatOpenAI LLM wrapper
+langchain-openai==0.3.18
+
+# Streamlit — Interactive web UI framework
+streamlit==1.45.1
+
+# python-dotenv — Load environment variables from .env files
+python-dotenv==1.1.0
+
+# wikipedia — Python wrapper for the Wikipedia API
+wikipedia==1.4.0
